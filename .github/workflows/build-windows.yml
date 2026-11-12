@@ -1,0 +1,176 @@
+name: Build Telegram Desktop EXE (v7.3.5 Anti-Delete)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, main ]
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout Telegram Desktop v7.3.5
+        uses: actions/checkout@v4
+        with:
+          repository: 'telegramdesktop/tdesktop'
+          ref: 'v7.3.5'
+          submodules: recursive
+
+      - name: Apply Anti-Delete Patch
+        shell: bash
+        run: |
+          echo "Applying Anti-Delete patch for messages, media and stickers..."
+          git apply << 'EOF'
+diff --git a/Telegram/SourceFiles/history/history_item.h b/Telegram/SourceFiles/history/history_item.h
+index 92a831e..f4820dc 100644
+--- a/Telegram/SourceFiles/history/history_item.h
++++ b/Telegram/SourceFiles/history/history_item.h
+@@ -215,6 +215,10 @@ public:
+ 	[[nodiscard]] bool isPinned() const;
++	[[nodiscard]] bool isAntiDeleted() const {
++		return _isAntiDeleted;
++	}
++	void markAntiDeleted();
++
+ 	[[nodiscard]] bool allowsForward() const;
+ 	[[nodiscard]] bool allowsEdit(TimeId now) const;
+@@ -480,6 +484,7 @@ private:
+ 	bool _unread : 1 = false;
+ 	bool _out : 1 = false;
++	bool _isAntiDeleted : 1 = false;
+ 
+ 	QDateTime _date;
+ };
+
+diff --git a/Telegram/SourceFiles/history/history_item.cpp b/Telegram/SourceFiles/history/history_item.cpp
+index 738491a..d81239c 100644
+--- a/Telegram/SourceFiles/history/history_item.cpp
++++ b/Telegram/SourceFiles/history/history_item.cpp
+@@ -342,6 +342,15 @@ void HistoryItem::destroy() {
+ 	delete this;
+ }
+ 
++void HistoryItem::markAntiDeleted() {
++	if (_isAntiDeleted) return;
++	_isAntiDeleted = true;
++	// Принудительно сохраняем кеш документа, фото или стикера
++	if (const auto media = this->media()) {
++		media->collectBytes();
++	}
++	customFieldsUpdated();
++}
++
+ bool HistoryItem::allowsForward() const {
+ 	if (isAntiDeleted()) {
+ 		return true; // Разрешаем пересылку сохраненного удаленного сообщения
+ 	}
+ 	return !isService() && (id > 0);
+ }
+
+diff --git a/Telegram/SourceFiles/data/data_session.cpp b/Telegram/SourceFiles/data/data_session.cpp
+index e7291a2..113f890 100644
+--- a/Telegram/SourceFiles/data/data_session.cpp
++++ b/Telegram/SourceFiles/data/data_session.cpp
+@@ -1420,6 +1420,25 @@ void Session::deleteMessages(
+ 	std::vector<MsgId> toDestroy;
+ 	toDestroy.reserve(ids.size());
+ 
++	// Проверка глобальной настройки Anti-Delete tdesktop v7.3.5
++	const bool antiDeleteEnabled = true;
++	if (antiDeleteEnabled) {
++		for (const auto msgId : ids) {
++			if (const auto item = message(msgId)) {
++				// Помечаем сообщение как удаленное собеседником
++				item->markAntiDeleted();
++				// Оповещаем представление для перерисовки (серый тон + урна)
++				notifyHistoryChangeDelayed(item->history());
++			}
++		}
++		// НЕ передаем удаление дальше в движок destroy(), сохраняя историю!
++		return;
++	}
++
+ 	for (const auto msgId : ids) {
+ 		if (const auto item = message(msgId)) {
+ 			toDestroy.push_back(msgId);
+
+diff --git a/Telegram/SourceFiles/history/view/history_view_message.cpp b/Telegram/SourceFiles/history/view/history_view_message.cpp
+index 81b29fa..aa48301 100644
+--- a/Telegram/SourceFiles/history/view/history_view_message.cpp
++++ b/Telegram/SourceFiles/history/view/history_view_message.cpp
+@@ -18,6 +18,7 @@
+ #include "history/view/history_view_cursor_state.h"
+ #include "ui/painter.h"
++#include <QtSvg/QSvgRenderer>
+ 
+ namespace HistoryView {
+ namespace {
+@@ -520,6 +521,21 @@ void Message::paint(
+ 	Painter &p,
+ 	const PaintContext &context) const {
+ 
++	const auto item = data();
++	const bool isDeleted = item && item->isAntiDeleted();
++	
++	// Если сообщение удалено - делаем его полупрозрачным / серым
++	const auto previousOpacity = p.opacity();
++	if (isDeleted) {
++		p.setOpacity(previousOpacity * 0.65);
++	}
++
+ 	paintCustomBackground(p, context);
+ 	paintContents(p, context);
++
++	if (isDeleted) {
++		p.setOpacity(previousOpacity);
++	}
+ }
+ 
+@@ -890,6 +906,34 @@ void Message::paintTime(
+ 	Painter &p,
+ 	const PaintContext &context) const {
+ 
+ 	_time.paint(p, timeX, timeY, context.outerWidth);
++
++	const auto item = data();
++	if (item && item->isAntiDeleted()) {
++		// Отрисовка точной SVG корзины пользователя рядом со временем
++		static const auto kUrnSvg = QByteArrayLiteral(R"(
++<svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" color="#000000">
++  <path d="M20 9L18.005 20.3463C17.8369 21.3026 17.0062 22 16.0353 22H7.96474C6.99379 22 6.1631 21.3026 5.99496 20.3463L4 9" fill="#e05555"></path>
++  <path d="M20 9L18.005 20.3463C17.8369 21.3026 17.0062 22 16.0353 22H7.96474C6.99379 22 6.1631 21.3026 5.99496 20.3463L4 9H20Z" stroke="#e05555" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
++  <path d="M21 6H15.375M3 6H8.625M8.625 6V4C8.625 2.89543 9.52043 2 10.625 2H13.375C14.4796 2 15.375 2.89543 15.375 4V6M8.625 6H15.375" stroke="#e05555" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
++</svg>
++		)");
++		static QSvgRenderer urnRenderer(kUrnSvg);
++		// Рисуем корзинку слева от метки времени или сразу за ней
++		const int urnSize = 13;
++		const int urnX = timeX - urnSize - 3;
++		const int urnY = timeY + 1;
++		urnRenderer.render(&p, QRect(urnX, urnY, urnSize, urnSize));
++	}
+ }
+EOF
+          echo "Patch applied successfully!"
+
+      - name: Setup Ninja and CMake
+        uses: ashley-tauro/setup-ninja@v1.0.0
+
+      - name: Prepare build environment
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          mkdir build && cd build
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
+
+      - name: Compile Telegram.exe
+        shell: cmd
+        run: |
+          cd build
+          ninja Telegram
+
+      - name: Upload Windows Telegram.exe Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-Desktop-v7.3.5-AntiDelete.exe
+          path: build/bin/Telegram.exe
